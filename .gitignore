@@ -1,0 +1,7 @@
+﻿__pycache__/
+*.pyc
+*.log
+build/
+.arduino/
+.DS_Store
+Thumbs.db

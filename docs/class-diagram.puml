@@ -1,0 +1,118 @@
+@startuml FreshSenseEmbebedSystem
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+skinparam shadowing false
+
+title Embebed System - FreshSense FS-FRUIT-1
+
+package "Codigo normal" {
+  class FreshSenseNode {
+    + begin()
+    + tick(supuestoActivo, temp, hum, ppm, recien)
+    - publish()
+    - selfTest()
+  }
+
+  class ClimateSensor {
+    + begin()
+    + read(temperatureC, humidityPct) : bool
+  }
+
+  class EthyleneSensor {
+    + begin()
+    + warmUp()
+    + readPpm() : float
+  }
+
+  class ReadingClock {
+    + begin()
+    + stamp() : String
+  }
+
+  class SensorReading {
+    + deviceId : String
+    + timestamp : String
+    + temperatureC : float
+    + humidityPct : float
+    + ethylenePpm : float
+    + meta : String
+    + isValid() : bool
+    + toJson() : String
+  }
+
+  class AlertActuators {
+    + begin()
+    + setEstado(LedFrescura)
+    + tick()
+  }
+
+  class ColdRoomFan {
+    + begin()
+    + setRunning(running)
+  }
+
+  class DeviceLink {
+    + connectWifi() : bool
+    + postReading(payload) : int
+    + postHeartbeat(payload) : int
+  }
+}
+
+package "Codigo del supuesto" {
+  class SupuestoUsb {
+    + tick()
+    + consumirRecien() : bool
+    + activo() : bool
+    + temperatureC() : float
+    + humidityPct() : float
+    + ethylenePpm() : float
+    + imprimirEstado()
+  }
+}
+
+FreshSenseNode *-- ClimateSensor
+FreshSenseNode *-- EthyleneSensor
+FreshSenseNode *-- ReadingClock
+FreshSenseNode *-- AlertActuators
+FreshSenseNode *-- ColdRoomFan
+FreshSenseNode *-- DeviceLink
+FreshSenseNode ..> SensorReading
+FreshSenseNode ..> SupuestoUsb : mando desde prototipo1.ino
+
+ClimateSensor ..> SensorReading : temp + humedad\ncada 3 min
+EthyleneSensor ..> SensorReading : ethylenePpm\ncada 1 min
+ReadingClock ..> SensorReading : timestamp
+SensorReading ..> AlertActuators : LED por temp/hum
+SensorReading ..> ColdRoomFan : ventilador por etileno
+SensorReading ..> DeviceLink : POST periodico
+SupuestoUsb ..> AlertActuators : SUPUESTO/REAL USB
+SupuestoUsb ..> ColdRoomFan : no tapa medicion real
+
+note bottom of ClimateSensor
+  AM2302 GPIO 4 (3V3)
+  Temp + humedad juntos
+end note
+
+note bottom of EthyleneSensor
+  MQ135 AO GPIO 34 (5V)
+  FAO: mantener < 1 ppm
+end note
+
+note bottom of AlertActuators
+  LED GPIO 27
+  Buzzer GPIO 25
+  SEMI = continuo
+  CRITICO = parpadeo
+end note
+
+note bottom of ColdRoomFan
+  Rele GPIO 26
+  Motor si etileno > 1 ppm
+end note
+
+note bottom of SupuestoUsb
+  Archivo aparte
+  FreshSenseSupuesto.h
+end note
+
+@enduml
