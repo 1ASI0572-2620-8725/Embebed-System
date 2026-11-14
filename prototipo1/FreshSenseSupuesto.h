@@ -7,6 +7,7 @@
 // Lee por USB lo que manda servidor.py:
 //   SUPUESTO temp hum ppm  -> mueve LED / buzzer / motor
 //   REAL                   -> actuadores vuelven a los sensores
+//   VENTILADOR OFF|AUTO    -> apaga el motor a mano, o lo devuelve a los sensores
 // No reemplaza SensorReading (AM2302 + MQ135 siguen midiendo).
 // =============================================================================
 
@@ -33,6 +34,7 @@ class SupuestoUsb {
   }
 
   bool activo() const { return encendido; }
+  bool ventiladorApagado() const { return apagadoManual; }
   float temperatureC() const { return temp; }
   float humidityPct() const { return hum; }
   float ethylenePpm() const { return ppm; }
@@ -58,10 +60,21 @@ class SupuestoUsb {
     if (linea.length() == 0) {
       return;
     }
+    if (linea.startsWith("VENTILADOR")) {
+      bool ahora = linea.indexOf("OFF") >= 0;
+      apagadoManual = ahora;
+      if (!ahora) {
+        recien = true;
+      }
+      Serial.println(ahora ? "Ventilador manual OFF." : "Ventilador manual AUTO.");
+      return;
+    }
     if (linea.startsWith("REAL")) {
+      if (encendido) {
+        recien = true;
+      }
       encendido = false;
-      recien = true;
-      Serial.println("Supuesto apagado. Los sensores siguen midiendo y mandan los actuadores.");
+      Serial.println("ACK REAL");
       return;
     }
     if (!linea.startsWith("SUPUESTO")) {
@@ -74,16 +87,32 @@ class SupuestoUsb {
     if (leidos != 3) {
       return;
     }
+    if (!encendido || distinto(temp, temperatura) || distinto(hum, humedad) || distinto(ppm, etileno)) {
+      recien = true;
+    }
     temp = temperatura;
     hum = humedad;
     ppm = etileno;
     encendido = true;
-    recien = true;
-    Serial.println("Supuesto activo.");
+    Serial.print("ACK SUPUESTO ");
+    Serial.print(temp, 1);
+    Serial.print(" ");
+    Serial.print(hum, 1);
+    Serial.print(" ");
+    Serial.println(ppm, 1);
+  }
+
+  static bool distinto(float a, float b) {
+    float d = a - b;
+    if (d < 0.0f) {
+      d = -d;
+    }
+    return d > 0.05f;
   }
 
   bool encendido = false;
   bool recien = false;
+  bool apagadoManual = false;
   float temp = 6.4f;
   float hum = 82.0f;
   float ppm = 5.0f;

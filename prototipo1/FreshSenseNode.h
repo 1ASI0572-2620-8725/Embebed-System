@@ -36,9 +36,8 @@ static const int BUZZER_PIN = 25;      // Buzzer MH-FMD I/O
 static const int FAN_PIN = 26;         // Relé IN → motor / ventilador
 
 // --- Polaridad de actuadores -------------------------------------------------
-// Relé azul HW-482: en ESTA placa IN en ALTO cierra COM-NO (motor ON).
-// Con true el motor iba al revés; aquí debe ser false.
-static const bool RELAY_ACTIVE_LOW = false;
+// Relé azul HW-482: IN en bajo cierra COM-NO y el motor gira.
+static const bool RELAY_ACTIVE_LOW = true;
 // Buzzer MH-FMD: leyenda 低电平触发 → suena con pin en LOW.
 static const bool BUZZER_ACTIVE_LOW = true;
 
@@ -51,19 +50,19 @@ static const char *DEVICE_TOKEN = "replace-with-device-token";
 
 static const char *FIRMWARE_VERSION = "1.0";
 
-// Lecturas van al Edge (Freshsense-EDGE): misma ruta /api/v1/sensor-readings.
-// Cambia TU_IP_PC por la IP de la computadora donde corre:
-//   flask --app src.app run --host 0.0.0.0 --port 5000
-// El heartbeat sigue al backend publicado del equipo.
-static const char *READINGS_URL = "http://TU_IP_PC:5000/api/v1/sensor-readings";
-static const char *HEARTBEAT_HOST = "https://35-224-123-160.sslip.io";
+// Edge local (Freshsense-EDGE en esta PC, Flask :5000).
+// Misma red WiFi que el ESP32. Si cambia la IP de la PC, actualiza EDGE_HOST.
+static const char *EDGE_HOST = "http://10.236.213.196:5000";
+static const char *READINGS_URL = "http://10.236.213.196:5000/api/v1/sensor-readings";
+// El Edge local no expone heartbeat; se omite el POST US06 en esta prueba.
+static const bool HEARTBEAT_ENABLED = false;
 
 // WiFi. En la placa escribe el nombre y la clave de tu red.
 // Si dejas TU_RED_WIFI, el LED, la bocina y el ventilador igual funcionan:
 // solo se queda sin envio al servidor.
 #if FRESHSENSE_REAL
-static const char *WIFI_SSID = "TU_RED_WIFI";
-static const char *WIFI_PASSWORD = "TU_CLAVE_WIFI";
+static const char *WIFI_SSID = "POCO X7 Pro";
+static const char *WIFI_PASSWORD = "TU_PASSWORD";
 static const int WIFI_CHANNEL = 0;
 #else
 static const char *WIFI_SSID = "Wokwi-GUEST";
@@ -142,13 +141,13 @@ enum LedFrescura {
 //
 // ETILENO (FAO: mantener < 1 ppm en camara)
 //   NORMAL:        0 .. 1 ppm
-//   SEMI:          > 1 .. 5 ppm     → ventilador ON (extraer gas)
-//   CRITICO:       > 5 ppm          → ventilador ON (urgencia)
+//   SEMI:          > 1 .. 5 ppm     → ventilador lento
+//   CRITICO:       > 5 ppm          → ventilador a máxima potencia
 //
 // ACTUADORES (independientes)
 //   LED     ← solo temperatura y humedad
 //             SEMI → continuo | CRITICO → parpadeo + buzzer
-//   Ventilador ← solo etileno (SEMI o CRITICO)
+//   Ventilador ← solo etileno. SEMI = más lento. CRITICO = potencia máxima.
 // =============================================================================
 
 enum NivelSensor {
@@ -210,16 +209,17 @@ inline NivelSensor peorDe(NivelSensor a, NivelSensor b) {
   return (b > a) ? b : a;
 }
 
-// LED solo por temp+hum. Ventilador solo por etileno. Frescura = peor de los 3.
+// LED y buzzer siguen el peor de temp, humedad y etileno.
+// Ventilador solo si el etileno pasa de normal (semi lento, crítico al máximo).
 inline void evaluarActuadores(NivelSensor t, NivelSensor h, NivelSensor e,
                               const char *&frescura, LedFrescura &led, bool &ventiladorGas) {
   NivelSensor peorClima = peorDe(t, h);
   NivelSensor peorTodo = peorDe(peorClima, e);
-  ventiladorGas = (e != SENSOR_OK);  // SEMI o CRITICO de gas → motor
+  ventiladorGas = (e != SENSOR_OK);
 
-  if (peorClima == SENSOR_CRITICO) {
+  if (peorTodo == SENSOR_CRITICO) {
     led = LED_PARPADEO;
-  } else if (peorClima == SENSOR_SEMI) {
+  } else if (peorTodo == SENSOR_SEMI) {
     led = LED_CONTINUO;
   } else {
     led = LED_APAGADO;
@@ -429,13 +429,17 @@ class AlertActuators {
       buzzerOn = false;
       writeBuzzer(false);
     } else if (modo == LED_CONTINUO) {
-      // Se va a malograr: luz roja fija, sin pitido.
       digitalWrite(LED_ALERT_PIN, HIGH);
       ledEncendido = true;
       buzzerOn = false;
       writeBuzzer(false);
+    } else {
+      ledEncendido = true;
+      digitalWrite(LED_ALERT_PIN, HIGH);
+      buzzerOn = true;
+      writeBuzzer(true);
+      lastBeepAt = millis();
     }
-    // SPOILED: tick() se encarga del parpadeo + buzzer.
   }
 
   // Compatibilidad con self-test y llamadas viejas.
@@ -471,22 +475,52 @@ class AlertActuators {
   unsigned long lastBeepAt = 0;
 };
 
+// SEMI: 1,3 s encendido y 0,7 s apagado. CRITICO: continuo.
+static const unsigned long FAN_SEMI_PERIOD_MS = 2000;
+static const unsigned long FAN_SEMI_ON_MS = 1300;
+
 // Ventilador de la camara: motor DC + helice via rele HW-482 (no KY-019).
 // GPIO 26 solo manda al pin IN. La corriente del motor va por COM (medio)
 // y NO (arriba) desde la raya 5V. NC queda vacio.
-// Ventilador por ETILENO (SEMI/CRITICO > 1 ppm), no por temperatura.
+// El relé no baja el voltaje: en SEMI se pulsa (más lento) y en CRITICO queda continuo.
 class ColdRoomFan {
  public:
   void begin() {
     pinMode(FAN_PIN, OUTPUT);
-    setRunning(false);
+    setNivel(SENSOR_OK);
   }
 
-  // running true → motor gira. Con RELAY_ACTIVE_LOW false, IN va a HIGH.
+  // SENSOR_OK apagado, SENSOR_SEMI más lento, SENSOR_CRITICO potencia máxima.
+  void setNivel(NivelSensor nivel) {
+    modo = nivel;
+    if (modo != SENSOR_SEMI) {
+      writeOn(modo == SENSOR_CRITICO);
+    }
+  }
+
+  void tick() {
+    if (modo == SENSOR_OK) {
+      writeOn(false);
+      return;
+    }
+    if (modo == SENSOR_CRITICO) {
+      writeOn(true);
+      return;
+    }
+    writeOn((millis() % FAN_SEMI_PERIOD_MS) < FAN_SEMI_ON_MS);
+  }
+
   void setRunning(bool running) {
-    bool pinHigh = RELAY_ACTIVE_LOW ? !running : running;
+    setNivel(running ? SENSOR_CRITICO : SENSOR_OK);
+  }
+
+ private:
+  void writeOn(bool on) {
+    bool pinHigh = RELAY_ACTIVE_LOW ? !on : on;
     digitalWrite(FAN_PIN, pinHigh ? HIGH : LOW);
   }
+
+  NivelSensor modo = SENSOR_OK;
 };
 
 // Envia la telemetria y el heartbeat.
@@ -532,9 +566,12 @@ class DeviceLink {
     return post(READINGS_URL, payload);
   }
 
-  // POST /api/v1/devices/{id}/heartbeat (US06).
+  // POST /api/v1/devices/{id}/heartbeat (US06). Solo si HEARTBEAT_ENABLED.
   int postHeartbeat(const String &payload) {
-    String url = String(HEARTBEAT_HOST) + "/api/v1/devices/" + DEVICE_ID + "/heartbeat";
+    if (!HEARTBEAT_ENABLED) {
+      return 0;
+    }
+    String url = String(EDGE_HOST) + "/api/v1/devices/" + DEVICE_ID + "/heartbeat";
     return post(url.c_str(), payload);
   }
 
@@ -544,26 +581,13 @@ class DeviceLink {
       return -1;
     }
 
-    // Edge local: http://  |  Backend publicado: https://
-    // El cliente WiFi debe vivir hasta despues de http.POST.
+    // Edge local usa http:// — WiFiClient (no TLS).
+    WiFiClient client;
     HTTPClient http;
-    if (strncmp(url, "https://", 8) == 0) {
-      WiFiClientSecure secure;
-      secure.setInsecure();
-      if (!http.begin(secure, url)) {
-        return -2;
-      }
-      http.addHeader("Content-Type", "application/json");
-      http.addHeader("X-Device-Token", DEVICE_TOKEN);
-      int code = http.POST(payload);
-      http.end();
-      return code;
-    }
-
-    WiFiClient plain;
-    if (!http.begin(plain, url)) {
+    if (!http.begin(client, url)) {
       return -2;
     }
+
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Device-Token", DEVICE_TOKEN);
     int code = http.POST(payload);
@@ -606,10 +630,15 @@ class FreshSenseNode {
     hayGas = false;
 #if FRESHSENSE_REAL
     Serial.println("FS-FRUIT-1: clima (temp+hum) cada 3 min; etileno cada 1 min.");
-    Serial.println("LED <- temp/humedad | Ventilador <- etileno (>1 ppm).");
+    Serial.println("LED y buzzer <- el peor de temp, humedad y etileno. Ventilador <- etileno.");
 #else
     Serial.println("Lectura Wokwi periodica.");
 #endif
+  }
+
+  // true = el botón de la página dejó el motor apagado hasta VENTILADOR AUTO.
+  void fijarVentiladorApagado(bool apagado) {
+    ventiladorApagadoManual = apagado;
   }
 
   // Args del supuesto: prototipo1.ino (FreshSenseSupuesto.h).
@@ -619,6 +648,9 @@ class FreshSenseNode {
             float supuestoPpm = 0.0f,
             bool supuestoRecien = false) {
     actuators.tick();
+    fan.tick();
+    // Cada vuelta: el supuesto manda los pines al instante, sin esperar al AM2302.
+    aplicarMando(supuestoActivo, supuestoTemp, supuestoHum, supuestoPpm);
     unsigned long now = millis();
     bool leerClima = supuestoRecien || (now >= nextClimateAt);
     bool leerGas = supuestoRecien || (now >= nextGasAt);
@@ -660,6 +692,10 @@ class FreshSenseNode {
                float supuestoPpm,
                bool leerClima,
                bool leerGas) {
+    (void)supuestoActivo;
+    (void)supuestoTemp;
+    (void)supuestoHum;
+    (void)supuestoPpm;
     if (leerClima) {
       float temperatureC = 0.0f;
       float humidityPct = 0.0f;
@@ -692,11 +728,6 @@ class FreshSenseNode {
 #endif
     }
 
-    float mandoTemp = supuestoActivo ? supuestoTemp : lastTempC;
-    float mandoHum = supuestoActivo ? supuestoHum : lastHumPct;
-    float mandoPpm = supuestoActivo ? supuestoPpm : lastPpm;
-    bool hayMando = supuestoActivo || (hayClima && hayGas);
-
     SensorReading reading;
     bool realValida = false;
     if (hayClima && hayGas) {
@@ -709,42 +740,6 @@ class FreshSenseNode {
       Serial.println("SensorReading");
       Serial.println(reading.toJson());
       realValida = reading.isValid();
-    }
-
-    if (!hayMando) {
-      actuators.setEstado(LED_APAGADO);
-      fan.setRunning(false);
-    } else {
-      NivelSensor nTemp = nivelTemperatura(mandoTemp);
-      NivelSensor nHum = nivelHumedad(mandoHum);
-      NivelSensor nEth = nivelEtileno(mandoPpm);
-      const char *frescura = "FRESH";
-      LedFrescura led = LED_APAGADO;
-      bool ventilador = false;
-      evaluarActuadores(nTemp, nHum, nEth, frescura, led, ventilador);
-      actuators.setEstado(led);
-      fan.setRunning(ventilador);
-
-      Serial.print("FS-FRUIT-1 ");
-      Serial.print(frescura);
-      Serial.print(" temp=");
-      Serial.print(nTemp);
-      Serial.print(" hum=");
-      Serial.print(nHum);
-      Serial.print(" eth=");
-      Serial.println(nEth);
-      if (led == LED_PARPADEO) {
-        Serial.println("LED parpadeo: temp/hum CRITICO.");
-      } else if (led == LED_CONTINUO) {
-        Serial.println("LED continuo: temp/hum SEMI.");
-      } else {
-        Serial.println("LED apagado: temp/hum OK.");
-      }
-      if (ventilador) {
-        Serial.println("Ventilador ON: etileno SEMI/CRITICO (>1 ppm).");
-      } else {
-        Serial.println("Ventilador OFF: etileno OK.");
-      }
     }
 
     if (!realValida || millis() < nextPostAt) {
@@ -769,6 +764,62 @@ class FreshSenseNode {
     Serial.println(heartbeatCode);
   }
 
+  void aplicarMando(bool supuestoActivo, float supuestoTemp, float supuestoHum, float supuestoPpm) {
+    float mandoTemp = supuestoActivo ? supuestoTemp : lastTempC;
+    float mandoHum = supuestoActivo ? supuestoHum : lastHumPct;
+    float mandoPpm = supuestoActivo ? supuestoPpm : lastPpm;
+    bool hayMando = supuestoActivo || (hayClima && hayGas);
+    LedFrescura led = LED_APAGADO;
+    NivelSensor fanNivel = SENSOR_OK;
+    const char *frescura = "FRESH";
+    NivelSensor nTemp = SENSOR_OK;
+    NivelSensor nHum = SENSOR_OK;
+    NivelSensor nEth = SENSOR_OK;
+    if (hayMando) {
+      nTemp = nivelTemperatura(mandoTemp);
+      nHum = nivelHumedad(mandoHum);
+      nEth = nivelEtileno(mandoPpm);
+      bool ventilador = false;
+      evaluarActuadores(nTemp, nHum, nEth, frescura, led, ventilador);
+      fanNivel = (ventiladorApagadoManual || nEth == SENSOR_OK) ? SENSOR_OK : nEth;
+    }
+    bool cambio = !mandoListo || led != mandoLed || fanNivel != mandoFan;
+    if (!mandoListo || led != mandoLed) {
+      actuators.setEstado(led);
+      mandoLed = led;
+    }
+    if (!mandoListo || fanNivel != mandoFan) {
+      fan.setNivel(fanNivel);
+      mandoFan = fanNivel;
+    }
+    mandoListo = true;
+    if (!cambio) {
+      return;
+    }
+    Serial.print("FS-FRUIT-1 ");
+    Serial.print(frescura);
+    Serial.print(" temp=");
+    Serial.print(nTemp);
+    Serial.print(" hum=");
+    Serial.print(nHum);
+    Serial.print(" eth=");
+    Serial.println(nEth);
+    if (led == LED_PARPADEO) {
+      Serial.println("LED parpadeo y buzzer: hay un valor critico.");
+    } else if (led == LED_CONTINUO) {
+      Serial.println("LED fijo: hay un valor semi. Buzzer apagado.");
+    } else {
+      Serial.println("LED apagado y buzzer apagado.");
+    }
+    if (fanNivel == SENSOR_OK) {
+      Serial.println("Ventilador apagado.");
+    } else if (fanNivel == SENSOR_SEMI) {
+      Serial.println("Ventilador medio.");
+    } else {
+      Serial.println("Ventilador al maximo.");
+    }
+  }
+
   ClimateSensor climate;
   EthyleneSensor ethylene;
   AlertActuators actuators;
@@ -783,4 +834,8 @@ class FreshSenseNode {
   float lastPpm;
   bool hayClima;
   bool hayGas;
+  bool ventiladorApagadoManual = false;
+  bool mandoListo = false;
+  LedFrescura mandoLed = LED_APAGADO;
+  NivelSensor mandoFan = SENSOR_OK;
 };

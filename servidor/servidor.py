@@ -21,13 +21,26 @@
 # =============================================================================
 
 import json
+import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
 PUERTO = 8080
+
+# --- EDGE: cada lectura REAL que llega por USB se reenvia a Freshsense-EDGE ---
+# Cambia con la variable de entorno FRESHSENSE_EDGE_URL si hace falta.
+EDGE_URL = os.environ.get(
+    "FRESHSENSE_EDGE_URL", "http://127.0.0.1:5000/api/v1/sensor-readings"
+)
+EDGE_TOKEN = os.environ.get("FRESHSENSE_EDGE_TOKEN", "replace-with-device-token")
+DEVICE_ID = "00000000-0000-0000-0000-000000000001"
+EDGE_ACTIVO = os.environ.get("FRESHSENSE_EDGE", "1") != "0"
+edge_estado = {"ultimo_codigo": None, "ultimo_error": "", "enviadas": 0, "ultima_hora": ""}
 
 # =============================================================================
 # ESTANDAR FS-FRUIT-1 — refrigeracion generica de frutas (cualquier tipo)
@@ -41,9 +54,9 @@ ESTANDAR = {
         "nota": "AM2302 temp+hum cada 3 min; MQ135 etileno cada 1 min",
     },
     "actuadores": {
-        "led": "temperatura y humedad",
-        "ventilador": "etileno",
-        "buzzer": "con LED en CRITICO de temp/hum",
+        "led": "el peor de temperatura, humedad y etileno",
+        "buzzer": "solo si ese peor valor es critico",
+        "ventilador": "solo etileno: semi medio, critico al maximo",
     },
     "temperatura": {
         "normal": {"min": 0.0, "max": 8.0},
@@ -101,9 +114,14 @@ def nivel_etileno(e):
 
 # Estado compartido entre el hilo USB y el navegador.
 candado = threading.Lock()
+serial_lock = threading.Lock()
+comando_lock = threading.Lock()
 estado = {
     "conectado": False,
     "puerto": "",
+    "revision": 0,
+    "ack": "",
+    "ack_en": 0.0,
     "lectura": None,  # medicion REAL (SensorReading del ESP32)
     # --- SUPUESTO (apartado aparte; no reemplaza "lectura") ---
     "supuesto": {
@@ -118,19 +136,19 @@ puerto_serial = None
 
 
 def decidir(temperatura, humedad, etileno):
-    """FS-FRUIT-1: LED<-temp/hum | ventilador<-etileno. Independiente por sensor."""
+    """LED y buzzer = el peor de los tres. Ventilador solo por etileno."""
     n_t = nivel_temperatura(temperatura)
     n_h = nivel_humedad(humedad)
     n_e = nivel_etileno(etileno)
     orden = {"OK": 0, "SEMI": 1, "CRITICO": 2}
     peor_clima = max((n_t, n_h), key=lambda n: orden[n])
     peor = max((peor_clima, n_e), key=lambda n: orden[n])
-    ventilador = n_e != "OK"  # gas SEMI o CRITICO
+    ventilador = n_e != "OK"
 
-    if peor_clima == "CRITICO":
+    if peor == "CRITICO":
         led = "parpadeo"
         buzzer = True
-    elif peor_clima == "SEMI":
+    elif peor == "SEMI":
         led = "continuo"
         buzzer = False
     else:
@@ -157,6 +175,7 @@ def decidir(temperatura, humedad, etileno):
         "led": led,
         "buzzer": buzzer,
         "ventilador": ventilador,
+        "velocidad": "maxima" if n_e == "CRITICO" else ("media" if n_e == "SEMI" else "apagado"),
         "humidityPct": float(humedad),
     }
 
@@ -169,6 +188,9 @@ def lectura_visible():
         lectura = estado["lectura"]
         conectado = estado["conectado"]
         puerto = estado["puerto"]
+        revision = estado["revision"]
+        ack = estado.get("ack") or ""
+        ack_en = estado.get("ack_en") or 0.0
     # --- SUPUESTO: calcula FRESH/AT_RISK/SPOILED solo para el panel de abajo ---
     if supuesto["activo"]:
         supuesto["alertas"] = decidir(
@@ -183,13 +205,18 @@ def lectura_visible():
         "puerto": puerto,
         "enVivo": bloque_en_vivo(lectura),  # ARRIBA: sensores reales
         "supuesto": supuesto,                 # ABAJO: supuesto (no tapa enVivo)
+        "revision": revision,
+        "placa": {
+            "confirmo": _ack_vigente(supuesto, ack, ack_en),
+            "ack": ack,
+        },
         "pines": {
             "am2302": 4,
             "mq135": 34,
             "led": 27,
             "buzzer": 25,
             "rele": 26,
-            "relayActiveLow": False,
+            "relayActiveLow": True,
             "buzzerActiveLow": True,
         },
         "umbrales": {
@@ -222,25 +249,113 @@ def bloque_en_vivo(lectura):
 # No toca estado["lectura"] / enVivo (medicion real).
 # En la placa lo recibe FreshSenseSupuesto.h
 # =============================================================================
+def redondear(valor, respaldo):
+    try:
+        return round(float(valor), 1)
+    except (TypeError, ValueError):
+        return round(float(respaldo), 1)
+
+
+def _ack_esperado(supuesto):
+    if supuesto.get("activo"):
+        return "ACK SUPUESTO %.1f %.1f %.1f" % (
+            supuesto["temperatureC"],
+            supuesto["humidityPct"],
+            supuesto["ethylenePpm"],
+        )
+    return "ACK REAL"
+
+
+def _ack_vigente(supuesto, ack, ack_en, ventana=8.0):
+    if not ack or (time.time() - float(ack_en or 0)) > ventana:
+        return False
+    return ack.strip() == _ack_esperado(supuesto)
+
+
 def aplicar_supuesto(cuerpo):
-    """Guarda el supuesto y lo envía a la placa. No toca enVivo."""
-    with candado:
-        previo = dict(estado["supuesto"])
-        if bool(cuerpo.get("activo")):
-            estado["supuesto"] = {
-                "activo": True,
-                "nombre": str(cuerpo.get("nombre", "")),
-                "temperatureC": float(cuerpo.get("temperatureC", previo["temperatureC"])),
-                "humidityPct": float(cuerpo.get("humidityPct", previo["humidityPct"])),
-                "ethylenePpm": float(cuerpo.get("ethylenePpm", previo["ethylenePpm"])),
-            }
-        else:
-            previo["activo"] = False
-            previo["nombre"] = ""
-            estado["supuesto"] = previo
-        actual = dict(estado["supuesto"])
-    enviar_a_la_placa(actual)  # --- SUPUESTO: escribe por USB ---
+    """Guarda el supuesto, lo manda a la placa y espera su ACK. No toca enVivo."""
+    with comando_lock:
+        with candado:
+            previo = dict(estado["supuesto"])
+            if bool(cuerpo.get("activo")):
+                estado["supuesto"] = {
+                    "activo": True,
+                    "nombre": str(cuerpo.get("nombre", "")).strip() or "Supuesto",
+                    "temperatureC": redondear(cuerpo.get("temperatureC"), previo["temperatureC"]),
+                    "humidityPct": redondear(cuerpo.get("humidityPct"), previo["humidityPct"]),
+                    "ethylenePpm": redondear(cuerpo.get("ethylenePpm"), previo["ethylenePpm"]),
+                }
+            else:
+                previo["activo"] = False
+                previo["nombre"] = ""
+                estado["supuesto"] = previo
+            estado["revision"] += 1
+            actual = dict(estado["supuesto"])
+        escribir_placa(comando_de(actual))
+        limite = time.time() + 1.6
+        proximo = time.time() + 0.35
+        while time.time() < limite:
+            with candado:
+                if _ack_vigente(actual, estado.get("ack") or "", estado.get("ack_en") or 0):
+                    break
+            time.sleep(0.05)
+            if time.time() >= proximo:
+                escribir_placa(comando_de(actual))
+                proximo = time.time() + 0.35
+    if actual["activo"]:
+        enviar_al_edge(lectura_de_supuesto(actual))
     return lectura_visible()
+
+
+def lectura_de_supuesto(supuesto):
+    """Arma el SensorReading del caso de prueba para que el Edge lo guarde."""
+    alertas = decidir(
+        supuesto["temperatureC"],
+        supuesto["humidityPct"],
+        supuesto["ethylenePpm"],
+    )
+    nombre = str(supuesto.get("nombre") or "supuesto").replace(";", " ")
+    return {
+        "deviceId": DEVICE_ID,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "temperatureC": float(supuesto["temperatureC"]),
+        "humidityPct": float(supuesto["humidityPct"]),
+        "ethylenePpm": float(supuesto["ethylenePpm"]),
+        "meta": "origen=supuesto;nombre=%s;frescura=%s;led=%s;buzzer=%s;ventilador=%s;velocidad=%s"
+        % (
+            nombre,
+            alertas["frescura"],
+            alertas["led"],
+            "on" if alertas["buzzer"] else "off",
+            "on" if alertas["ventilador"] else "off",
+            alertas["velocidad"],
+        ),
+    }
+
+
+def completar_para_edge(lectura):
+    """Agrega frescura y actuadores para que el Edge guarde el mismo estado que la página."""
+    dato = dict(lectura)
+    if "frescura=" in str(dato.get("meta") or ""):
+        return dato
+    try:
+        alertas = decidir(
+            float(dato["temperatureC"]),
+            float(dato["humidityPct"]),
+            float(dato["ethylenePpm"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return dato
+    extra = "frescura=%s;led=%s;buzzer=%s;ventilador=%s;velocidad=%s" % (
+        alertas["frescura"],
+        alertas["led"],
+        "on" if alertas["buzzer"] else "off",
+        "on" if alertas["ventilador"] else "off",
+        alertas["velocidad"],
+    )
+    previo = str(dato.get("meta") or "").strip(";")
+    dato["meta"] = extra if not previo else previo + ";" + extra
+    return dato
 
 
 def guardar_lectura(lectura):
@@ -250,36 +365,112 @@ def guardar_lectura(lectura):
         estado["conectado"] = True
 
 
-# --- SUPUESTO: linea USB hacia FreshSenseSupuesto.h en el ESP32 ---
-def enviar_a_la_placa(supuesto):
-    """Escribe SUPUESTO t h ppm\\n o REAL\\n al ESP32 por USB."""
-    global puerto_serial
-    if puerto_serial is None:
+# --- EDGE: POST /api/v1/sensor-readings (mismo JSON que arma el firmware) ---
+def enviar_al_edge(lectura):
+    """Reenvia la lectura real al Edge local sin bloquear el hilo USB."""
+    if not EDGE_ACTIVO:
         return
-    if supuesto["activo"]:
-        linea = "SUPUESTO %.1f %.1f %.1f\n" % (
+
+    def _enviar():
+        try:
+            cuerpo = json.dumps(completar_para_edge(lectura)).encode("utf-8")
+            peticion = urllib.request.Request(
+                EDGE_URL,
+                data=cuerpo,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Device-Token": EDGE_TOKEN,
+                },
+            )
+            with urllib.request.urlopen(peticion, timeout=5) as resp:
+                edge_estado["ultimo_codigo"] = resp.status
+                edge_estado["ultimo_error"] = ""
+        except urllib.error.HTTPError as exc:
+            edge_estado["ultimo_codigo"] = exc.code
+            edge_estado["ultimo_error"] = exc.read().decode("utf-8", "ignore")[:200]
+        except Exception as exc:
+            edge_estado["ultimo_codigo"] = None
+            edge_estado["ultimo_error"] = str(exc)
+        edge_estado["enviadas"] += 1
+        edge_estado["ultima_hora"] = time.strftime("%H:%M:%S")
+        print(
+            "EDGE <- lectura temp=%s hum=%s eth=%s -> HTTP %s %s"
+            % (
+                lectura.get("temperatureC"),
+                lectura.get("humidityPct"),
+                lectura.get("ethylenePpm"),
+                edge_estado["ultimo_codigo"],
+                edge_estado["ultimo_error"],
+            )
+        )
+
+    threading.Thread(target=_enviar, daemon=True).start()
+
+
+# --- SUPUESTO: linea USB hacia FreshSenseSupuesto.h en el ESP32 ---
+def comando_de(supuesto):
+    """Linea USB que entiende FreshSenseSupuesto.h."""
+    if supuesto.get("activo"):
+        return "SUPUESTO %.1f %.1f %.1f\n" % (
             supuesto["temperatureC"],
             supuesto["humidityPct"],
             supuesto["ethylenePpm"],
         )
-    else:
-        linea = "REAL\n"
+    return "REAL\n"
+
+
+def escribir_placa(linea):
+    """Escribe una linea al ESP32. El hilo USB lee el ACK."""
+    global puerto_serial
+    with serial_lock:
+        serie = puerto_serial
+        if serie is None:
+            return False
+        try:
+            serie.write(linea.encode("utf-8"))
+            serie.flush()
+            return True
+        except Exception:
+            serie_rota = serie
     try:
-        puerto_serial.write(linea.encode("utf-8"))
-        puerto_serial.flush()
+        serie_rota.close()
     except Exception:
-        cerrar_puerto()
+        pass
+    with serial_lock:
+        if puerto_serial is serie_rota:
+            puerto_serial = None
+    with candado:
+        estado["conectado"] = False
+        estado["puerto"] = ""
+    return False
+
+
+def mantener_placa():
+    """Repite el caso vigente para que un reset del ESP32 no vuelva solo a los sensores."""
+    while True:
+        time.sleep(3)
+        with comando_lock:
+            with candado:
+                actual = dict(estado["supuesto"])
+                ack = estado.get("ack") or ""
+                ack_en = estado.get("ack_en") or 0
+            if _ack_vigente(actual, ack, ack_en):
+                continue
+            escribir_placa(comando_de(actual))
 
 
 def cerrar_puerto():
     """Cierra el COM y marca desconectado."""
     global puerto_serial
-    if puerto_serial is not None:
+    with serial_lock:
+        serie = puerto_serial
+        puerto_serial = None
+    if serie is not None:
         try:
-            puerto_serial.close()
+            serie.close()
         except Exception:
             pass
-        puerto_serial = None
     with candado:
         estado["conectado"] = False
         estado["puerto"] = ""
@@ -322,7 +513,8 @@ def buscar_puerto():
             serie = serial.Serial(nombre, 115200, timeout=0.1)
         except Exception:
             continue
-        puerto_serial = serie
+        with serial_lock:
+            puerto_serial = serie
         with candado:
             estado["conectado"] = True
             estado["puerto"] = nombre
@@ -330,11 +522,36 @@ def buscar_puerto():
         return
 
 
+def guardar_acks(buffer):
+    """Saca las lineas ACK del buffer y deja el resto para el JSON."""
+    partes = buffer.split("\n")
+    incompleto = partes[-1]
+    quedan = []
+    acks = []
+    for linea in partes[:-1]:
+        limpia = linea.strip()
+        if limpia.startswith("ACK "):
+            acks.append(limpia)
+        else:
+            quedan.append(linea)
+    nuevo = "\n".join(quedan)
+    if nuevo:
+        nuevo += "\n"
+    nuevo += incompleto
+    if acks:
+        with candado:
+            estado["ack"] = acks[-1]
+            estado["ack_en"] = time.time()
+    return nuevo
+
+
 def hilo_serial():
     """Hilo daemon: busca COM y parsea JSON SensorReading del firmware."""
     buffer = ""
     while True:
-        if puerto_serial is None:
+        with serial_lock:
+            serie = puerto_serial
+        if serie is None:
             try:
                 buscar_puerto()
             except Exception:
@@ -342,7 +559,10 @@ def hilo_serial():
             time.sleep(1.5)
             continue
         try:
-            trozo = puerto_serial.read(512)
+            with serial_lock:
+                if puerto_serial is None:
+                    continue
+                trozo = puerto_serial.read(512)
         except Exception:
             cerrar_puerto()
             buffer = ""
@@ -353,6 +573,7 @@ def hilo_serial():
         buffer += trozo.decode("utf-8", errors="ignore")
         if len(buffer) > 8000:
             buffer = buffer[-4000:]
+        buffer = guardar_acks(buffer)
         # El firmware imprime JSON pretty; re.S permite saltos de línea.
         for bloque in re.findall(r"\{.*?\}", buffer, flags=re.S):
             try:
@@ -365,6 +586,7 @@ def hilo_serial():
             if "supuesto=1" in str(dato.get("meta", "")):
                 continue
             guardar_lectura(dato)
+            enviar_al_edge(dato)  # --- EDGE: reenvio de la lectura real ---
             buffer = buffer[buffer.rfind(bloque) + len(bloque) :]
 
 
@@ -438,6 +660,12 @@ PAGINA = """<!DOCTYPE html>
   .pastilla.aire { background: #1d6f8a; color: white; }
   button, .supuestos button { border: 0; border-radius: 8px; padding: 10px 12px; background: #1d6f8a; color: white; cursor: pointer; }
   .supuestos { display: flex; gap: 8px; flex-wrap: wrap; }
+  .supuestos button { text-align: left; display: grid; gap: 2px; min-width: 260px; line-height: 1.25; }
+  .supuestos button small { font-weight: 400; opacity: 0.92; }
+  .supuestos button.elegido { outline: 3px solid #16343c; background: #0e4f5e; }
+  .aviso { font-size: 14px; margin: 8px 0 0; }
+  .aviso.ok { color: #1d7a45; }
+  .aviso.no { color: #b42318; }
   .secundario { background: #d7e1e4; color: #16343c; }
   label { display: grid; gap: 4px; font-size: 14px; }
   input { width: 100%; }
@@ -454,7 +682,7 @@ PAGINA = """<!DOCTYPE html>
 <header>
   <h1>Prototipo 1 · FreshSense</h1>
   <p>Nodo de cámara de frío. Arriba: AM2302 (GPIO 4) + MQ135 (GPIO 34) en tiempo real.
-  Abajo: supuesto por USB — no sustituye la medición. Relé con <code>RELAY_ACTIVE_LOW = false</code>.</p>
+  Abajo: supuesto por USB — no sustituye la medición. El relé enciende el motor con IN en bajo.</p>
 </header>
 <main>
   <section>
@@ -465,7 +693,7 @@ PAGINA = """<!DOCTYPE html>
   <section>
     <h2>Medición en tiempo real</h2>
     <p class="nota">Sale del AM2302 y del MQ135 cada ~2 s. El supuesto de abajo no cambia estos números.
-    En habitación ~26 °C es normal ver AT_RISK y ventilador ON (&gt; 8 °C). Etileno ~0 ppm en aire limpio tras calibración es normal.</p>
+    Si cualquier valor llega a crítico, el LED parpadea y suena el buzzer. El ventilador solo depende del etileno: semi más lento, crítico a tope, y apagado si el gas está en 0–1 ppm.</p>
     <div class="rejilla">
       <div class="dato"><span>Temperatura</span><strong id="temp">-</strong></div>
       <div class="dato"><span>Humedad</span><strong id="hum">-</strong></div>
@@ -479,25 +707,19 @@ PAGINA = """<!DOCTYPE html>
   <!-- ========== AQUI VA EL SUPUESTO (HTML) ========== -->
   <section class="aparte">
     <h2>Supuesto de prueba</h2>
-    <p class="nota">Manda <code>SUPUESTO temp hum ppm</code> al ESP32 (FreshSenseSupuesto.h). Solo mueve LED (27), buzzer (25) y motor vía relé (26).
-    La medición de arriba sigue siendo la de los sensores. <code>Quitar supuesto</code> manda <code>REAL</code>.</p>
-    <div class="supuestos">
-      <button data-t="4" data-h="92" data-g="2" data-n="Cámara fría">Cámara fría (FRESH)</button>
-      <button data-t="10" data-h="92" data-g="2" data-n="Frio semi">Frio semi (AT_RISK)</button>
-      <button data-t="4" data-h="92" data-g="3" data-n="Etileno semi">Etileno semi (AT_RISK)</button>
-      <button data-t="4" data-h="87" data-g="2" data-n="Humedad semi">Humedad semi (AT_RISK)</button>
-      <button data-t="14" data-h="92" data-g="2" data-n="Frio critico">Frio critico (SPOILED)</button>
-      <button data-t="4" data-h="92" data-g="8" data-n="Etileno critico">Etileno critico (SPOILED)</button>
-      <button data-t="10" data-h="87" data-g="3" data-n="Varios semi">Varios semi (sigue AT_RISK)</button>
-      <button class="secundario" id="real">Quitar supuesto</button>
-    </div>
+    <p class="nota">Cada botón manda esos tres números al ESP32 y espera confirmación. El texto del botón es exactamente lo que deben hacer el LED, el buzzer y el ventilador.
+    La medición de arriba no cambia. El caso también se guarda en el Edge.
+    <code>Quitar supuesto</code> devuelve el LED, el buzzer y el ventilador a los sensores reales.</p>
+    <div class="supuestos" id="casos"></div>
     <div class="rejilla" style="margin-top:12px">
       <label>Temperatura °C<input id="in-temp" type="number" value="4" step="0.1"></label>
       <label>Humedad %<input id="in-hum" type="number" value="92" step="0.1"></label>
-      <label>Etileno ppm<input id="in-gas" type="number" value="2" step="0.1"></label>
+      <label>Etileno ppm<input id="in-gas" type="number" value="0.4" step="0.1"></label>
     </div>
+    <p class="nota" id="previo">Escribe los números y mira aquí qué haría la placa antes de aplicarlos.</p>
     <p><button id="aplicar">Aplicar este supuesto</button></p>
     <p class="frescura" id="sup-frescura">Sin supuesto</p>
+    <p class="aviso" id="sup-placa"></p>
     <div class="rejilla">
       <div class="dato"><span>Temperatura del supuesto</span><strong id="sup-temp">-</strong></div>
       <div class="dato"><span>Humedad del supuesto</span><strong id="sup-hum">-</strong></div>
@@ -508,7 +730,7 @@ PAGINA = """<!DOCTYPE html>
 
   <section>
     <h2>Estandar FS-FRUIT-1 (cualquier fruta)</h2>
-    <p class="nota">Misma tabla que el firmware. SEMI = se va a malograr. CRITICO = ya se malogro (o 2 SEMI).</p>
+    <p class="nota">Misma tabla que el firmware. Un SEMI deja la fruta en riesgo (LED fijo). Cualquier CRÍTICO la da por malograda (LED parpadeo y buzzer). El ventilador no mira la temperatura ni la humedad.</p>
     <table>
       <thead><tr><th>Sensor</th><th>NORMAL</th><th>SEMI-CRITICO</th><th>CRITICO</th></tr></thead>
       <tbody>
@@ -519,7 +741,8 @@ PAGINA = """<!DOCTYPE html>
     </table>
     <ul>
       <li>Lecturas: clima (temp+hum) cada <strong>3 min</strong>; etileno cada <strong>1 min</strong>.</li>
-      <li><strong>LED</strong> solo por temp/humedad. <strong>Ventilador</strong> solo por etileno (&gt;1 ppm).</li>
+      <li><strong>LED y buzzer</strong> siguen el peor de temperatura, humedad y etileno. Crítico: LED parpadea y suena el buzzer. Semi: LED fijo.</li>
+      <li><strong>Ventilador</strong> solo por etileno: semi = más lento, crítico = potencia máxima.</li>
       <li>Independiente: un solo sensor SEMI/CRITICO ya avisa.</li>
       <li>AM2302 GPIO 4 · MQ135 GPIO 34 · LED 27 · Buzzer 25 · Relé 26</li>
     </ul>
@@ -562,13 +785,87 @@ function textoLed(led) {
   return "apagado";
 }
 
+function nivelDe(temperatura, humedad, etileno) {
+  const nT = (temperatura > 12 || temperatura < -1) ? "CRITICO" : (temperatura > 8 || temperatura < 0) ? "SEMI" : "OK";
+  const nH = (humedad < 85 || humedad > 98) ? "CRITICO" : (humedad < 90 || humedad > 95) ? "SEMI" : "OK";
+  const nE = etileno > 5 ? "CRITICO" : etileno > 1 ? "SEMI" : "OK";
+  const orden = { OK: 0, SEMI: 1, CRITICO: 2 };
+  const peor = [nT, nH, nE].sort((a, b) => orden[b] - orden[a])[0];
+  return {
+    niveles: { temperatura: nT, humedad: nH, etileno: nE },
+    frescura: peor === "CRITICO" ? "SPOILED" : peor === "SEMI" ? "AT_RISK" : "FRESH",
+    led: peor === "CRITICO" ? "parpadeo" : peor === "SEMI" ? "continuo" : "apagado",
+    buzzer: peor === "CRITICO",
+    ventilador: nE !== "OK",
+    velocidad: nE === "CRITICO" ? "maxima" : nE === "SEMI" ? "media" : "apagado"
+  };
+}
+
+function frase(alertas) {
+  const led = alertas.led === "parpadeo" ? "LED parpadeo" : alertas.led === "continuo" ? "LED fijo" : "LED apagado";
+  const buzz = alertas.buzzer ? "buzzer sonando" : "buzzer apagado";
+  const fan = alertas.velocidad === "maxima" ? "ventilador al máximo" : alertas.velocidad === "media" ? "ventilador a media" : "ventilador apagado";
+  return led + " · " + buzz + " · " + fan;
+}
+
+function textoNivel(codigo) {
+  if (codigo === "SEMI") return "semi";
+  if (codigo === "CRITICO") return "crítico";
+  return "normal";
+}
+
+const CASOS = [
+  { nombre: "Cámara fría", t: 4, h: 92, g: 0.4 },
+  { nombre: "Frío semi", t: 10, h: 92, g: 0.4 },
+  { nombre: "Humedad semi", t: 4, h: 87, g: 0.4 },
+  { nombre: "Frío crítico", t: 14, h: 92, g: 0.4 },
+  { nombre: "Etileno semi", t: 4, h: 92, g: 3 },
+  { nombre: "Etileno crítico", t: 4, h: 92, g: 8 },
+  { nombre: "Clima y etileno semi", t: 10, h: 87, g: 3 }
+];
+
+function armarCasos() {
+  const caja = $("casos");
+  CASOS.forEach((caso) => {
+    const efecto = nivelDe(caso.t, caso.h, caso.g);
+    const boton = document.createElement("button");
+    boton.dataset.t = String(caso.t);
+    boton.dataset.h = String(caso.h);
+    boton.dataset.g = String(caso.g);
+    boton.dataset.n = caso.nombre;
+    boton.innerHTML = "<strong>" + caso.nombre + "</strong>"
+      + "<small>" + caso.t.toFixed(1) + " °C · " + caso.h.toFixed(1) + " % · " + caso.g.toFixed(1) + " ppm · " + efecto.frescura + "</small>"
+      + "<small>" + frase(efecto) + "</small>";
+    boton.addEventListener("click", () => {
+      $("in-temp").value = caso.t;
+      $("in-hum").value = caso.h;
+      $("in-gas").value = caso.g;
+      mostrarPrevio();
+      mandar({
+        activo: true,
+        nombre: caso.nombre,
+        temperatureC: caso.t,
+        humidityPct: caso.h,
+        ethylenePpm: caso.g
+      });
+    });
+    caja.appendChild(boton);
+  });
+  const quitar = document.createElement("button");
+  quitar.id = "real";
+  quitar.className = "secundario";
+  quitar.textContent = "Quitar supuesto";
+  quitar.addEventListener("click", () => mandar({ activo: false }));
+  caja.appendChild(quitar);
+}
+
 function pastillas(alertas) {
   const ledClase = alertas.led === "parpadeo" ? "parpadeo"
     : (alertas.led === "continuo" || alertas.led === true) ? "encendido" : "";
   const partes = [
     ["LED", textoLed(alertas.led), ledClase],
     ["Buzzer", alertas.buzzer ? "encendido" : "apagado", alertas.buzzer ? "encendido" : ""],
-    ["Ventilador", alertas.ventilador ? "encendido" : "apagado", alertas.ventilador ? "aire" : ""]
+    ["Ventilador", alertas.velocidad === "maxima" ? "máxima" : (alertas.velocidad === "media" ? "media" : "apagado"), alertas.ventilador ? "aire" : ""]
   ];
   return partes.map(([nombre, texto, clase]) =>
     '<span class="pastilla ' + clase + '">' + nombre + ": " + texto + "</span>"
@@ -577,7 +874,7 @@ function pastillas(alertas) {
 
 function pintar(dato) {
   $("placa").textContent = dato.conectado
-    ? "Placa en " + dato.puerto + " (CP210x). Medición arriba = sensores. Relé activo-HIGH (RELAY_ACTIVE_LOW false)."
+    ? "Placa en " + dato.puerto + " (CP210x). Medición arriba = sensores. El ventilador gira con el relé en bajo."
     : "ESP32 no está en el USB o el COM está ocupado. Conecta Silicon Labs CP210x, cierra el Monitor Serie y reinicia este servidor.";
   const vivo = dato.enVivo;
   if (!vivo) {
@@ -611,6 +908,7 @@ function pintar(dato) {
     }
   }
   const supuesto = dato.supuesto;
+  marcarElegido(supuesto);
   if (!supuesto.activo || !supuesto.alertas) {
     $("sup-temp").textContent = "-";
     $("sup-hum").textContent = "-";
@@ -618,58 +916,105 @@ function pintar(dato) {
     $("sup-frescura").textContent = "Sin supuesto. Los actuadores siguen la medición real.";
     $("sup-frescura").className = "frescura";
     $("sup-activos").innerHTML = "";
+    pintarPlaca(dato, null);
     return;
   }
+  const niveles = supuesto.alertas.niveles;
   $("sup-temp").textContent = supuesto.temperatureC.toFixed(1) + " °C";
   $("sup-hum").textContent = supuesto.humidityPct.toFixed(1) + " %";
   $("sup-gas").textContent = supuesto.ethylenePpm.toFixed(1) + " ppm";
-  $("sup-frescura").textContent = supuesto.nombre + ": " + supuesto.alertas.frescura;
+  $("sup-frescura").textContent = supuesto.nombre + ": " + supuesto.alertas.frescura
+    + " · temperatura " + textoNivel(niveles.temperatura)
+    + " · humedad " + textoNivel(niveles.humedad)
+    + " · etileno " + textoNivel(niveles.etileno);
   $("sup-frescura").className = "frescura " + supuesto.alertas.frescura;
   $("sup-activos").innerHTML = pastillas(supuesto.alertas);
+  pintarPlaca(dato, supuesto);
 }
+
+function casiIgual(a, b) {
+  return Math.abs(Number(a) - Number(b)) < 0.05;
+}
+
+function marcarElegido(supuesto) {
+  document.querySelectorAll("#casos button[data-t]").forEach((boton) => {
+    const activo = !!(supuesto && supuesto.activo)
+      && casiIgual(boton.dataset.t, supuesto.temperatureC)
+      && casiIgual(boton.dataset.h, supuesto.humidityPct)
+      && casiIgual(boton.dataset.g, supuesto.ethylenePpm)
+      && boton.dataset.n === supuesto.nombre;
+    boton.classList.toggle("elegido", activo);
+  });
+}
+
+function pintarPlaca(dato, supuesto) {
+  const aviso = $("sup-placa");
+  if (!dato.conectado) {
+    aviso.className = "aviso no";
+    aviso.textContent = "La placa no está en el USB, así que este caso no puede aplicarse.";
+    return;
+  }
+  if (dato.placa && dato.placa.confirmo) {
+    aviso.className = "aviso ok";
+    aviso.textContent = supuesto
+      ? "La placa confirmó este caso: " + frase(supuesto.alertas) + "."
+      : "La placa confirmó que volvió a los sensores reales.";
+    return;
+  }
+  aviso.className = "aviso no";
+  aviso.textContent = "Enviado. La placa todavía no confirmó; se reintenta solo.";
+}
+
+function mostrarPrevio() {
+  const t = Number($("in-temp").value);
+  const h = Number($("in-hum").value);
+  const g = Number($("in-gas").value);
+  if (![t, h, g].every(Number.isFinite)) {
+    $("previo").textContent = "Escribe temperatura, humedad y etileno.";
+    return;
+  }
+  const efecto = nivelDe(t, h, g);
+  $("previo").textContent = "Si aplicas estos números: " + efecto.frescura + " · " + frase(efecto)
+    + ". Temperatura " + textoNivel(efecto.niveles.temperatura)
+    + ", humedad " + textoNivel(efecto.niveles.humedad)
+    + ", etileno " + textoNivel(efecto.niveles.etileno) + ".";
+}
+
+let revisionVista = 0;
 
 async function pedir() {
   const respuesta = await fetch("/api/estado");
-  pintar(await respuesta.json());
+  const dato = await respuesta.json();
+  if ((dato.revision || 0) < revisionVista) return;
+  pintar(dato);
 }
 
-// --- SUPUESTO: envia el caso de prueba al servidor / ESP32 ---
 async function mandar(cuerpo) {
   const respuesta = await fetch("/api/supuesto", {
     method: "POST",
     headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify(cuerpo)
   });
-  pintar(await respuesta.json());
+  const dato = await respuesta.json();
+  if ((dato.revision || 0) < revisionVista) return;
+  revisionVista = dato.revision || 0;
+  pintar(dato);
 }
-
-// --- SUPUESTO: botones Camara fria / gas / calor / etc. ---
-document.querySelectorAll(".supuestos button[data-t]").forEach((boton) => {
-  boton.addEventListener("click", () => {
-    $("in-temp").value = boton.dataset.t;
-    $("in-hum").value = boton.dataset.h;
-    $("in-gas").value = boton.dataset.g;
-    mandar({
-      activo: true,
-      nombre: boton.dataset.n,
-      temperatureC: Number(boton.dataset.t),
-      humidityPct: Number(boton.dataset.h),
-      ethylenePpm: Number(boton.dataset.g)
-    });
-  });
-});
 
 $("aplicar").addEventListener("click", () => {
   mandar({
     activo: true,
-    nombre: "Numeros elegidos",
+    nombre: "Números elegidos",
     temperatureC: Number($("in-temp").value),
     humidityPct: Number($("in-hum").value),
     ethylenePpm: Number($("in-gas").value)
   });
 });
-
-$("real").addEventListener("click", () => mandar({ activo: false }));
+["in-temp", "in-hum", "in-gas"].forEach((id) => {
+  $(id).addEventListener("input", mostrarPrevio);
+});
+armarCasos();
+mostrarPrevio();
 setInterval(pedir, 1000);
 pedir();
 </script>
@@ -681,7 +1026,8 @@ pedir();
 if __name__ == "__main__":
     hilo = threading.Thread(target=hilo_serial, daemon=True)
     hilo.start()
+    threading.Thread(target=mantener_placa, daemon=True).start()
     print("FreshSense prototipo 1 → http://%s:%d" % (HOST, PUERTO))
     print("Cierra el Monitor Serie de Arduino. Prefiere COM Silicon Labs CP210x.")
-    print("Pines: AM2302=4 MQ135=34 LED=27 Buzzer=25 Rele=26 (RELAY_ACTIVE_LOW false)")
+    print("Pines: AM2302=4 MQ135=34 LED=27 Buzzer=25 Rele=26 (RELAY_ACTIVE_LOW true)")
     ThreadingHTTPServer((HOST, PUERTO), Sitio).serve_forever()

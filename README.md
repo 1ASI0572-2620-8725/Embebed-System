@@ -8,14 +8,14 @@ Organización: [1ASI0572-2620-8725](https://github.com/1ASI0572-2620-8725)
 
 | Señal | Lectura | NORMAL | SEMI | CRÍTICO | Actuador |
 |---|---|---|---|---|---|
-| Temperatura | cada **3 min** (AM2302) | 0–8 °C | (−1…0) o (8…12] | &lt;−1 o &gt;12 | **LED** |
-| Humedad | cada **3 min** (AM2302) | 90–95 % | 85–90 o 95–98 | &lt;85 o &gt;98 | **LED** |
-| Etileno | cada **1 min** (MQ135) | 0–1 ppm | &gt;1–5 | &gt;5 | **Ventilador** |
+| Temperatura | cada **3 min** (AM2302) | 0–8 °C | (−1…0) o (8…12] | &lt;−1 o &gt;12 | LED y buzzer |
+| Humedad | cada **3 min** (AM2302) | 90–95 % | 85–90 o 95–98 | &lt;85 o &gt;98 | LED y buzzer |
+| Etileno | cada **1 min** (MQ135) | 0–1 ppm | &gt;1–5 | &gt;5 | LED, buzzer y ventilador |
 
-- **LED continuo** = temp/hum SEMI (se va a malograr)  
-- **LED parpadeo + buzzer** = temp/hum CRÍTICO (ya se malogró)  
-- **Ventilador** = etileno SEMI o CRÍTICO (&gt; 1 ppm)  
-- Independiente: **basta un sensor** anómalo para avisar  
+- **LED fijo** = el peor de los tres está en SEMI. El buzzer sigue apagado.
+- **LED parpadeo + buzzer** = cualquiera de los tres está en CRÍTICO.
+- **Ventilador** solo por etileno: SEMI más lento, CRÍTICO a tope. Temperatura y humedad no lo encienden.
+- Independiente: **basta un sensor** anómalo para avisar.  
 
 Frescura agregada: **FRESH** / **AT_RISK** / **SPOILED**.
 
@@ -40,7 +40,7 @@ ESP32-S 38 pines, USB-C, CP2102. **No** se pincha en la protoboard.
 | MQ135 AO | GPIO **34** | 5V; 220 Ω en serie; DO vacío |
 | LED | GPIO **27** | 220 Ω; pata larga = ánodo |
 | Buzzer MH-FMD I/O | GPIO **25** | Activo LOW |
-| Relé IN | GPIO **26** | `RELAY_ACTIVE_LOW = false` |
+| Relé IN | GPIO **26** | `RELAY_ACTIVE_LOW = true` (IN en bajo cierra COM-NO) |
 | Pines 6–12 | vacíos | Memoria / strapping |
 
 ### Tabla de conexiones (fuente de verdad)
@@ -97,20 +97,9 @@ Abre **http://127.0.0.1:8080**
 
 Cierra el Monitor Serie de Arduino antes de abrir el servidor (si no: Acceso denegado en el COM).
 
-### 3. WiFi + Edge (Freshsense-EDGE)
+### 3. WiFi (opcional)
 
-En `FreshSenseNode.h`:
-
-1. `WIFI_SSID` / `WIFI_PASSWORD` → tu red (misma que el PC).
-2. `READINGS_URL` → `http://IP_DE_TU_PC:5000/api/v1/sensor-readings`
-   (sustituye `TU_IP_PC`; el POST acepta HTTP local y HTTPS del backend).
-3. En el PC: [Freshsense-EDGE](https://github.com/1ASI0572-2620-8725/Freshsense-EDGE)
-   con `flask --app src.app run --host 0.0.0.0 --port 5000`.
-
-El Edge responde `freshness` (GREEN/YELLOW/RED) y `freshnessEmbedded`
-(FRESH/AT_RISK/SPOILED), alineado a FS-FRUIT-1. El heartbeat sigue al backend publicado.
-
-Si dejas `TU_RED_WIFI`, sensores y actuadores locales igual funcionan (sin envío).
+En `FreshSenseNode.h`, cambia `WIFI_SSID` / `WIFI_PASSWORD`. Si dejas `TU_RED_WIFI`, sensores y actuadores locales igual funcionan.
 
 ## Diagrama de clases
 

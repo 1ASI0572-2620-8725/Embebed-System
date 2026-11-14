@@ -31,6 +31,7 @@ void setup() {
 void loop() {
   // --- supuesto (FreshSenseSupuesto.h) ---
   supuesto.tick();
+  node.fijarVentiladorApagado(supuesto.ventiladorApagado());
   bool recien = supuesto.consumirRecien();
 
   // --- codigo normal (FreshSenseNode.h) ---
